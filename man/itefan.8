@@ -1,0 +1,157 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.Dd October 4, 2026
+.Dt ITEFAN 8
+.Os
+.Sh NAME
+.Nm itefan
+.Nd read and set fan speed on an ITE IT8613E Super I/O chip
+.Sh SYNOPSIS
+.Nm
+.Op Fl f
+.Op Fl p Ar port
+.Op Cm show
+.Nm
+.Op Fl f
+.Op Fl p Ar port
+.Cm set
+.Ar channel duty
+.Nm
+.Op Fl f
+.Op Fl p Ar port
+.Cm pct
+.Ar channel percent
+.Nm
+.Op Fl f
+.Op Fl p Ar port
+.Cm auto
+.Ar channel
+.Sh DESCRIPTION
+The
+.Nm
+utility talks directly to the environment controller of the
+ITE IT8613E Super I/O chip, as found in the UGREEN NASync DXP2800,
+through
+.Xr io 4 .
+It can show the chip's temperature sensors, fan speeds and PWM settings,
+and switch a fan channel between the chip's automatic mode and a fixed
+speed.
+.Pp
+The chip has five PWM channels, numbered 1 to 5.
+On the DXP2800 the system fan is on channel 3.
+Unconnected channels report 0 rpm.
+.Pp
+A channel in
+.Em manual
+mode runs at the duty cycle last written to it, whatever the temperature.
+A channel in
+.Em auto
+mode follows the fan curve programmed into the chip by the firmware.
+.Pp
+The commands are:
+.Bl -tag -width "pct channel percent"
+.It Cm show
+Show the chip ID, the environment controller address, the three
+temperature sensors, and for each channel the fan speed in rpm,
+the raw control register, the mode and the duty cycle.
+This is the default when no command is given, and it changes nothing.
+.It Cm set Ar channel duty
+Put
+.Ar channel
+in manual mode at
+.Ar duty ,
+a raw value from 0 (off) to 255 (full speed).
+.It Cm pct Ar channel percent
+Same as
+.Cm set ,
+with the duty given as a percentage from 0 to 100.
+A trailing
+.Ql %
+is accepted.
+.It Cm auto Ar channel
+Hand
+.Ar channel
+back to the chip's automatic mode.
+.El
+.Pp
+The options are:
+.Bl -tag -width "-p port"
+.It Fl f
+Do not check the chip ID.
+Without this option
+.Nm
+refuses to run on anything but an IT8613E, because other ITE chips
+may use different registers.
+.It Fl p Ar port
+Use only the Super I/O configuration port
+.Ar port ,
+usually
+.Li 0x2e
+or
+.Li 0x4e .
+By default both are tried.
+.El
+.Sh IMPLEMENTATION NOTES
+The register layout follows the Linux it87 driver:
+PWM control registers 0x15, 0x16, 0x17, 0x7f and 0xa7
+.Pq bit 7 set means automatic ,
+8-bit duty registers 0x63, 0x6b, 0x73, 0x7b and 0xa3,
+and temperature registers 0x29 to 0x2b.
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+Show the current state:
+.Pp
+.Dl # itefan
+.Pp
+Run the system fan at 40%:
+.Pp
+.Dl # itefan pct 3 40
+.Pp
+Give control back to the firmware:
+.Pp
+.Dl # itefan auto 3
+.Pp
+If the
+.Xr fancurve 8
+service is running, it overrides manual settings within one interval.
+Stop it first:
+.Bd -literal -offset indent
+# service fancurve stop
+# itefan pct 3 40
+.Ed
+.Sh DIAGNOSTICS
+.Bl -diag
+.It "itefan: open /dev/io (run as root): Permission denied"
+Access to I/O ports needs root privileges.
+.It "itefan: no ITE Super I/O found"
+No ITE chip answered on the configuration ports.
+.It "itefan: not an IT8613E; register map may differ"
+A different ITE chip was found.
+Use
+.Fl f
+only if its registers are known to match.
+.El
+.Sh SEE ALSO
+.Xr io 4 ,
+.Xr superio 4 ,
+.Xr fancurve 8
+.Sh AUTHORS
+.An pdillinger@gmail.com
+.Sh CAVEATS
+A fan left in manual mode at a low duty cycle will not speed up when the
+system gets hot.
+Use
+.Cm auto
+or
+.Xr fancurve 8
+for unattended operation.
+.Pp
+.Nm
+accesses the hardware without locking.
+Do not run it while another program or kernel driver, such as
+.Xr superio 4
+with a hardware monitor attached, is using the same chip.
+.Pp
+The firmware may reprogram the chip at boot or after suspend.

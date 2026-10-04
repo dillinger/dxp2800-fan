@@ -1,0 +1,27 @@
+[
+{ type: install
+  message: <<EOM
+itefan talks to the hardware directly. Check the readings first:
+
+  itefan                       # fan should show rpm on its channel
+
+Find the lowest speed at which the fan still spins:
+
+  itefan pct 3 25 ; sleep 5 ; itefan
+
+Then enable the temperature-driven service:
+
+  sysrc kld_list+=coretemp
+  sysrc fancurve_enable=YES
+  service fancurve start
+
+All settings and how the fan reacts are explained in fancurve(8);
+the tool itself in itefan(8):
+
+  man fancurve
+  man itefan
+
+Settings take effect after "service fancurve restart".
+EOM
+}
+]

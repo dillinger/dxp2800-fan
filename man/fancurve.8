@@ -1,0 +1,263 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.Dd October 4, 2026
+.Dt FANCURVE 8
+.Os
+.Sh NAME
+.Nm fancurve
+.Nd temperature-driven fan control for the UGREEN DXP2800
+.Sh SYNOPSIS
+.Nm service fancurve
+.Cm start | stop | restart | status
+.Nm
+.Op Fl v
+.Op Fl c Ar channel
+.Op Fl i Ar interval
+.Op Fl w Ar window
+.Op Fl m Ar min
+.Op Fl u Ar stepup
+.Op Fl s Ar stepdown
+.Op Fl C Ar lo : Ns Ar hi
+.Op Fl X Ar crit
+.Op Fl D Ar lo : Ns Ar hi
+.Op Fl d Ar disks
+.Sh DESCRIPTION
+.Nm
+sets the speed of the system fan from the CPU and disk temperatures,
+using
+.Xr itefan 8 .
+It is normally run by the
+.Pa fancurve
+.Xr rc 8
+service under
+.Xr daemon 8 ,
+and configured in
+.Xr rc.conf 5 .
+.Pp
+Every
+.Va fancurve_interval
+seconds
+.Nm
+does the following:
+.Bl -enum
+.It
+Read the hottest CPU core from
+.Xr coretemp 4
+and average it over the last
+.Va fancurve_window
+seconds, so that short spikes do not change the fan speed much.
+.It
+Turn the average into a target speed with the CPU curve: at or below
+.Ar lo
+the target is
+.Va fancurve_min ,
+at or above
+.Ar hi
+it is 100%, and in between it rises linearly.
+.It
+About once a minute, read the hottest disk with
+.Xr smartctl 8
+and turn it into a target with the disk curve in the same way.
+Disks in standby are not woken up.
+The higher of the CPU and disk targets is used.
+.It
+Move the fan towards the target by at most
+.Va fancurve_step_up
+percent faster, or
+.Va fancurve_step_down
+percent slower, per interval.
+.It
+Write the result with
+.Ql itefan pct .
+The value is written every interval, so a reset by the firmware is
+corrected within one interval.
+.El
+.Pp
+Two situations skip the averaging and rate limits and set 100% at once:
+a single CPU reading at or above
+.Va fancurve_crit ,
+and a CPU temperature that cannot be read at all.
+.Pp
+When
+.Nm
+stops, for any reason, the fan channel is handed back to the chip's
+automatic mode.
+The rc script does this as well, even if
+.Nm
+had already exited.
+.Sh RC.CONF VARIABLES
+All variables are optional except
+.Va fancurve_enable .
+Run
+.Ql service fancurve restart
+after changing them.
+.Bl -tag -width "fancurve_step_down"
+.It Va fancurve_enable
+Set to
+.Dq YES
+to start
+.Nm
+at boot.
+Default:
+.Dq NO .
+.It Va fancurve_channel
+PWM channel the fan is connected to.
+Default: 3.
+.It Va fancurve_interval
+Seconds between readings.
+Default: 10.
+.It Va fancurve_window
+Seconds over which the CPU temperature is averaged.
+Larger values make the fan calmer but slower to react.
+Default: 60.
+.It Va fancurve_min
+Lowest fan speed in percent.
+Check that the fan still turns at this value.
+Default: 25.
+.It Va fancurve_step_up
+Largest increase per interval, in percent.
+Default: 10.
+.It Va fancurve_step_down
+Largest decrease per interval, in percent.
+Default: 5.
+.It Va fancurve_cpu
+CPU curve as
+.Dq Ar lo : Ns Ar hi
+in degrees Celsius.
+Default:
+.Dq 50:80 .
+.It Va fancurve_crit
+CPU temperature at which a single reading sets 100% immediately.
+Must not be below the
+.Ar hi
+value of
+.Va fancurve_cpu .
+Default: 90.
+.It Va fancurve_disks
+Disks to watch, for example
+.Dq ada0 ada1 nvme0 ;
+.Dq auto
+for all SATA and NVMe disks; empty for none.
+Ignored if
+.Xr smartctl 8
+is not installed.
+Default:
+.Dq auto .
+.It Va fancurve_disk
+Disk curve as
+.Dq Ar lo : Ns Ar hi
+in degrees Celsius.
+Default:
+.Dq 38:50 .
+.It Va fancurve_verbose
+Set to
+.Dq YES
+to log every reading, which helps when tuning.
+By default only changes of 10% or more are logged.
+Default:
+.Dq NO .
+.El
+.Pp
+The command line options set the same values:
+.Fl c
+channel,
+.Fl i
+interval,
+.Fl w
+window,
+.Fl m
+min,
+.Fl u
+step up,
+.Fl s
+step down,
+.Fl C
+CPU curve,
+.Fl X
+crit,
+.Fl D
+disk curve,
+.Fl d
+disks,
+.Fl v
+verbose.
+.Sh FILES
+.Bl -tag -width "/usr/local/etc/rc.d/fancurve" -compact
+.It Pa /usr/local/sbin/fancurve
+the control loop
+.It Pa /usr/local/etc/rc.d/fancurve
+the rc service script
+.It Pa /var/run/fancurve.pid
+PID of the supervising
+.Xr daemon 8
+.El
+.Sh EXAMPLES
+Enable the service with the defaults:
+.Bd -literal -offset indent
+# sysrc kld_list+=coretemp
+# sysrc fancurve_enable=YES
+# service fancurve start
+.Ed
+.Pp
+A quieter setup that reacts more slowly and never drops below 30%:
+.Bd -literal -offset indent
+# sysrc fancurve_window=120 fancurve_step_up=5 fancurve_min=30
+# service fancurve restart
+.Ed
+.Pp
+Ignore the disks and use only the CPU:
+.Bd -literal -offset indent
+# sysrc fancurve_disks=""
+# service fancurve restart
+.Ed
+.Pp
+Watch what it does:
+.Bd -literal -offset indent
+# sysrc fancurve_verbose=YES
+# service fancurve restart
+# tail -f /var/log/messages | grep fancurve
+.Ed
+.Sh DIAGNOSTICS
+Messages go to
+.Xr syslog 3
+with the tag
+.Ql fancurve .
+.Bl -diag
+.It "cpu 72C (avg 64C) disk 41C -> fan 60%"
+Current CPU reading, its average, the hottest disk, and the speed set.
+.It "cannot read CPU temperature (coretemp loaded?), fan to 100%"
+No CPU temperature is available.
+Load
+.Xr coretemp 4 .
+.It "smartctl not installed, ignoring disks"
+Install sysutils/smartmontools to include disk temperatures.
+.It "itefan failed to set N%"
+.Xr itefan 8
+returned an error; run it by hand to see why.
+.It "invalid number 'X' in settings"
+A value in
+.Xr rc.conf 5
+is not a number.
+.It "stopped, channel N back to automatic"
+Normal shutdown.
+.El
+.Sh SEE ALSO
+.Xr coretemp 4 ,
+.Xr rc.conf 5 ,
+.Xr daemon 8 ,
+.Xr itefan 8 ,
+.Xr rc 8 ,
+.Xr smartctl 8
+.Sh AUTHORS
+.An pdillinger@gmail.com
+.Sh CAVEATS
+Make sure the fan still turns at
+.Va fancurve_min ;
+some fans stop below a certain duty cycle.
+.Pp
+Do not change the fan with
+.Xr itefan 8
+while
+.Nm
+is running; it overrides manual settings within one interval.

@@ -1,0 +1,197 @@
+#!/bin/sh
+#
+# fancurve - temperature-driven fan control using itefan.
+# Normally started by %%PREFIX%%/etc/rc.d/fancurve; settings come from rc.conf.
+#
+# usage: fancurve [-v] [-c channel] [-i interval] [-w window] [-m min%]
+#                 [-u stepup%] [-s stepdown%] [-C cpulo:cpuhi] [-X crit]
+#                 [-D disklo:diskhi] [-d "disks"|auto]
+#
+# The CPU temperature is sampled every <interval> seconds and averaged over
+# the last <window> seconds, so short spikes don't rev the fan. The fan
+# speeds up by at most <stepup>% and slows down by at most <stepdown>% per
+# interval. A single reading at or above <crit> sets 100 % immediately.
+#
+# On exit the fan goes back to the chip's automatic mode.
+# If the CPU temperature can't be read, the fan goes to 100 %.
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:%%PREFIX%%/sbin:%%PREFIX%%/bin
+ITEFAN=%%PREFIX%%/sbin/itefan
+
+CH=3
+INTERVAL=10
+WINDOW=60
+MIN_PCT=25
+MAX_STEP_UP=10
+MAX_STEP_DOWN=5
+CPU_CURVE=50:80
+CPU_CRIT=90
+DISK_CURVE=38:50
+DISKS=auto
+DISK_EVERY_SEC=60
+VERBOSE=0
+
+log() { logger -t fancurve "$*"; }
+die() { log "$*"; echo "fancurve: $*" >&2; exit 1; }
+
+isnum() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
+
+while getopts vc:i:w:m:u:s:C:X:D:d: opt; do
+	case $opt in
+	v) VERBOSE=1 ;;
+	c) CH=$OPTARG ;;
+	i) INTERVAL=$OPTARG ;;
+	w) WINDOW=$OPTARG ;;
+	m) MIN_PCT=$OPTARG ;;
+	u) MAX_STEP_UP=$OPTARG ;;
+	s) MAX_STEP_DOWN=$OPTARG ;;
+	C) CPU_CURVE=$OPTARG ;;
+	X) CPU_CRIT=$OPTARG ;;
+	D) DISK_CURVE=$OPTARG ;;
+	d) DISKS=$OPTARG ;;
+	*) die "bad option" ;;
+	esac
+done
+
+CPU_LO=${CPU_CURVE%%:*};  CPU_HI=${CPU_CURVE##*:}
+DISK_LO=${DISK_CURVE%%:*}; DISK_HI=${DISK_CURVE##*:}
+
+for v in "$CH" "$INTERVAL" "$WINDOW" "$MIN_PCT" "$MAX_STEP_UP" \
+    "$MAX_STEP_DOWN" "$CPU_LO" "$CPU_HI" "$CPU_CRIT" "$DISK_LO" "$DISK_HI"; do
+	isnum "$v" || die "invalid number '$v' in settings"
+done
+[ "$CPU_LO" -lt "$CPU_HI" ]   || die "fancurve_cpu: LO must be below HI"
+[ "$DISK_LO" -lt "$DISK_HI" ] || die "fancurve_disk: LO must be below HI"
+[ "$CPU_CRIT" -ge "$CPU_HI" ] || die "fancurve_crit must be >= the CPU HI value"
+[ "$MIN_PCT" -le 100 ]        || die "fancurve_min must be 0..100"
+[ "$INTERVAL" -ge 1 ]         || die "fancurve_interval must be >= 1"
+[ "$MAX_STEP_UP" -ge 1 ]      || die "fancurve_step_up must be >= 1"
+[ "$MAX_STEP_DOWN" -ge 1 ]    || die "fancurve_step_down must be >= 1"
+[ -x "$ITEFAN" ]              || die "$ITEFAN not found"
+
+if [ "$DISKS" = auto ]; then
+	DISKS=$( { sysctl -n kern.disks | tr ' ' '\n' | grep -E '^ada[0-9]+$';
+	    ls /dev | grep -E '^nvme[0-9]+$'; } 2>/dev/null | sort | tr '\n' ' ')
+fi
+if [ -n "$DISKS" ] && ! command -v smartctl >/dev/null 2>&1; then
+	log "smartctl not installed, ignoring disks"
+	DISKS=""
+fi
+DISK_EVERY=$(( (DISK_EVERY_SEC + INTERVAL - 1) / INTERVAL ))
+NSAMP=$(( (WINDOW + INTERVAL - 1) / INTERVAL ))
+[ "$NSAMP" -lt 1 ] && NSAMP=1
+
+cleanup() {
+	"$ITEFAN" auto "$CH" >/dev/null 2>&1
+	log "stopped, channel $CH back to automatic"
+}
+trap 'cleanup; exit 0' INT TERM HUP
+
+# curve TEMP LO HI -> percent
+curve() {
+	local t=$1 lo=$2 hi=$3
+	if [ "$t" -le "$lo" ]; then
+		echo "$MIN_PCT"
+	elif [ "$t" -ge "$hi" ]; then
+		echo 100
+	else
+		echo $(( MIN_PCT + (t - lo) * (100 - MIN_PCT) / (hi - lo) ))
+	fi
+}
+
+# rolling average of the last NSAMP CPU readings; result in AVG
+samples=""
+avg_push() {
+	local s sum=0 n=0
+	samples="$samples $1"
+	set -- $samples
+	while [ $# -gt "$NSAMP" ]; do shift; done
+	samples="$*"
+	for s in $samples; do
+		sum=$((sum + s)); n=$((n + 1))
+	done
+	AVG=$(( (sum + n / 2) / n ))
+}
+
+# hottest CPU core in whole degrees (coretemp.ko), empty if unreadable
+cpu_temp() {
+	sysctl dev.cpu 2>/dev/null | awk '
+		/\.temperature:/ { t = $2; sub(/C$/, "", t); t = int(t); if (t > m) m = t }
+		END { if (m > 0) print m }'
+}
+
+# hottest awake disk, 0 if none readable; never wakes sleeping disks.
+# Readings outside 1..99 C are treated as garbage and ignored.
+disk_temp() {
+	local d t max=0
+	for d in $DISKS; do
+		t=$(smartctl -n standby -A "/dev/$d" 2>/dev/null | awk '
+			$1 == 190 || $1 == 194 { t = $10 }
+			/^Temperature:/       { t = $2 }
+			END { if (t != "") print int(t) }')
+		isnum "$t" || continue
+		[ "$t" -ge 1 ] && [ "$t" -le 99 ] || continue
+		[ "$t" -gt "$max" ] && max=$t
+	done
+	echo "$max"
+}
+
+log "starting: channel $CH, cpu $CPU_LO-${CPU_HI}C avg ${WINDOW}s crit ${CPU_CRIT}C," \
+    "disks ${DISKS:-none} $DISK_LO-${DISK_HI}C, min ${MIN_PCT}%," \
+    "+${MAX_STEP_UP}/-${MAX_STEP_DOWN}% per ${INTERVAL}s"
+
+cur=-1
+logged=-100
+n=0
+dt=""
+AVG=""
+disk_pct=$MIN_PCT
+warned=0
+
+while :; do
+	urgent=0
+	ct=$(cpu_temp)
+	if [ -z "$ct" ]; then
+		want=100
+		urgent=1
+		[ $warned -eq 0 ] && log "cannot read CPU temperature (coretemp loaded?), fan to 100%"
+		warned=1
+	else
+		warned=0
+		avg_push "$ct"
+		want=$(curve "$AVG" "$CPU_LO" "$CPU_HI")
+		if [ -n "$DISKS" ] && [ $((n % DISK_EVERY)) -eq 0 ]; then
+			dt=$(disk_temp)
+			disk_pct=$(curve "$dt" "$DISK_LO" "$DISK_HI")
+		fi
+		[ "$disk_pct" -gt "$want" ] && want=$disk_pct
+		if [ "$ct" -ge "$CPU_CRIT" ]; then
+			want=100
+			urgent=1
+		fi
+	fi
+
+	# change gradually in both directions, except in an emergency
+	if [ $cur -ge 0 ] && [ $urgent -eq 0 ]; then
+		if [ "$want" -gt $((cur + MAX_STEP_UP)) ]; then
+			want=$((cur + MAX_STEP_UP))
+		elif [ "$want" -lt $((cur - MAX_STEP_DOWN)) ]; then
+			want=$((cur - MAX_STEP_DOWN))
+		fi
+	fi
+
+	# rewritten every interval so a firmware reset is overridden quickly
+	"$ITEFAN" pct "$CH" "$want" >/dev/null 2>&1 ||
+	    log "itefan failed to set ${want}%"
+	cur=$want
+
+	diff=$((want - logged))
+	if [ $VERBOSE -eq 1 ] || [ $diff -ge 10 ] || [ $diff -le -10 ]; then
+		log "cpu ${ct:-?}C (avg ${AVG:-?}C) disk ${dt:-?}C -> fan ${want}%"
+		logged=$want
+	fi
+
+	n=$((n + 1))
+	sleep "$INTERVAL" &
+	wait $!
+done

@@ -1,0 +1,103 @@
+#!/bin/sh
+
+# PROVIDE: fancurve
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# Add these lines to /etc/rc.conf to enable fancurve:
+#
+# fancurve_enable (bool):   Set to "YES" to enable.           Default: "NO"
+# fancurve_channel (int):   PWM channel the fan is on.        Default: 3
+# fancurve_interval (int):  Seconds between readings.         Default: 10
+# fancurve_window (int):    Average the CPU temperature over
+#                           this many seconds (smooths spikes). Default: 60
+# fancurve_min (int):       Lowest fan speed in percent.      Default: 25
+# fancurve_step_up (int):   Max % faster per interval.        Default: 10
+# fancurve_step_down (int): Max % slower per interval.        Default: 5
+# fancurve_cpu (str):       CPU curve "LO:HI" in degrees C.   Default: "50:80"
+#                           At/below LO -> fancurve_min, at/above HI -> 100 %.
+# fancurve_crit (int):      A single CPU reading at/above this
+#                           sets 100 % at once, no averaging.  Default: 90
+# fancurve_disks (str):     Disks to watch, e.g. "ada0 ada1 nvme0",
+#                           "auto" for all SATA/NVMe, "" for none.
+#                                                             Default: "auto"
+# fancurve_disk (str):      Disk curve "LO:HI" in degrees C.  Default: "38:50"
+# fancurve_verbose (bool):  Log every reading (for tuning).   Default: "NO"
+
+. /etc/rc.subr
+
+name=fancurve
+rcvar=fancurve_enable
+
+load_rc_config $name
+
+: ${fancurve_enable:="NO"}
+: ${fancurve_channel:="3"}
+: ${fancurve_interval:="10"}
+: ${fancurve_window:="60"}
+: ${fancurve_min:="25"}
+: ${fancurve_step_up:="10"}
+: ${fancurve_step_down:="5"}
+: ${fancurve_cpu:="50:80"}
+: ${fancurve_crit:="90"}
+: ${fancurve_disks="auto"}
+: ${fancurve_disk:="38:50"}
+: ${fancurve_verbose:="NO"}
+
+pidfile="/var/run/${name}.pid"
+script="%%PREFIX%%/sbin/fancurve"
+itefan="%%PREFIX%%/sbin/itefan"
+
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+status_cmd="${name}_status"
+
+fancurve_running()
+{
+	[ -f "$pidfile" ] && pgrep -F "$pidfile" >/dev/null 2>&1
+}
+
+fancurve_start()
+{
+	if fancurve_running; then
+		echo "${name} is already running."
+		return 1
+	fi
+	kldload -n coretemp
+	verbose=""
+	checkyesno fancurve_verbose && verbose="-v"
+	echo "Starting ${name}."
+	/usr/sbin/daemon -P "$pidfile" -r -S -T "$name" \
+	    /bin/sh "$script" $verbose \
+	    -c "$fancurve_channel" -i "$fancurve_interval" -w "$fancurve_window" \
+	    -m "$fancurve_min" -u "$fancurve_step_up" -s "$fancurve_step_down" \
+	    -C "$fancurve_cpu" -X "$fancurve_crit" \
+	    -D "$fancurve_disk" -d "$fancurve_disks"
+}
+
+fancurve_stop()
+{
+	if fancurve_running; then
+		echo "Stopping ${name}."
+		pid=$(cat "$pidfile")
+		kill "$pid"
+		pwait -t 15 "$pid" 2>/dev/null
+	else
+		echo "${name} is not running."
+	fi
+	# always hand the fan back to the chip's automatic mode
+	"$itefan" auto "$fancurve_channel" >/dev/null 2>&1
+	rm -f "$pidfile"
+}
+
+fancurve_status()
+{
+	if fancurve_running; then
+		echo "${name} is running as pid $(cat "$pidfile")."
+	else
+		echo "${name} is not running."
+		return 1
+	fi
+}
+
+run_rc_command "$1"

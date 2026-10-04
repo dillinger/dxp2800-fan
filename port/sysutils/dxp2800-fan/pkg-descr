@@ -1,0 +1,10 @@
+dxp2800-fan is fan control for the UGREEN NASync DXP2800.
+
+It provides itefan, which reads and sets the fan PWM outputs of the
+ITE IT8613E Super I/O chip in that machine (and similar boards) by
+talking to the chip's environment controller through /dev/io.
+
+fancurve is a small rc(8) service built on itefan. It sets the fan
+speed from the hottest CPU core (coretemp(4)) and, optionally, the
+hottest disk (smartmontools), and returns the fan to the chip's
+automatic mode when stopped. The curve is configured in rc.conf(5).
